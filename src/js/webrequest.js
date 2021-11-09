@@ -76,6 +76,47 @@ function guessTabIdFromInitiator(details) {
   return +tid;
 }
 
+/**
+ * Returns the hostname of the top-level document the request came from
+ * according to browser-specific properties on the request details object.
+ *
+ * @param {Object} details webRequest request details object
+ *
+ * @returns {?String} the hostname or null
+ */
+function getInitiatorHostForRequest(details) {
+  let host = null,
+    url;
+
+  // Firefox 58+
+  if (utils.hasOwn(details, "documentUrl") && utils.hasOwn(details, "frameAncestors")) {
+    if (details.frameAncestors.length) {
+      // inside a frame
+      url = details.frameAncestors[details.frameAncestors.length - 1].url;
+    } else {
+      // inside the top-level document
+      url = details.documentUrl;
+    }
+
+  // Chrome 63+
+  } else if (utils.hasOwn(details, "initiator")) {
+    if (details.initiator && details.initiator != "null") {
+      if (details.parentFrameId == -1 || details.type == "sub_frame" && details.parentFrameId === 0) {
+        // can only rely on initiator for main frame resources:
+        // https://crbug.com/838242#c17
+        // also note that "initiator" does not give us the complete URL
+        url = details.initiator + '/';
+      }
+    }
+  }
+
+  if (url) {
+    host = window.extractHostFromURL(url);
+  }
+
+  return host;
+}
+
 /***************** Blocking Listener Functions **************/
 
 /**
@@ -133,11 +174,27 @@ function onBeforeRequest(details) {
   if (frameData) {
     tab_host = frameData.host;
   } else {
+    // we could still be getting requests initiated by a recently closed tab
     if (utils.hasOwn(badger.recentTabUrls, tab_id)) {
       tab_host = badger.recentTabUrls[tab_id].host;
       from_current_tab = false;
     } else {
       return {};
+    }
+  }
+
+  // request tab URL misattribution
+  // our tab URL doesn't match initiator/documentUrl
+  // scenarios:
+  // - rapid navigation (page still loading, you navigate elsewhere): requests belong to previous tab URL
+  // - (tracking) requests fired off in response to you navigating away: requests belong to previous tab URL
+  // - SW-initiated document redirection in Chrome: requests belong to current tab URL but our tab URL is stale
+  // we can work around the first two cases with recentTabUrls (will want to set from_current_tab to false)
+  let initiator_host = getInitiatorHostForRequest(details);
+  if (initiator_host && tab_host != initiator_host) {
+    if (badger.recentTabUrls[tab_id] && initiator_host == badger.recentTabUrls[tab_id].host) {
+      tab_host = initiator_host;
+      from_current_tab = false;
     }
   }
 
@@ -332,6 +389,14 @@ function onBeforeSendHeaders(details) {
     }
   }
 
+  let initiator_host = getInitiatorHostForRequest(details);
+  if (initiator_host && tab_host != initiator_host) {
+    if (badger.recentTabUrls[tab_id] && initiator_host == badger.recentTabUrls[tab_id].host) {
+      tab_host = initiator_host;
+      from_current_tab = false;
+    }
+  }
+
   let request_host = window.extractHostFromURL(url);
 
   // CNAME uncloaking
@@ -473,6 +538,14 @@ function onHeadersReceived(details) {
       from_current_tab = false;
     } else {
       return {};
+    }
+  }
+
+  let initiator_host = getInitiatorHostForRequest(details);
+  if (initiator_host && tab_host != initiator_host) {
+    if (badger.recentTabUrls[tab_id] && initiator_host == badger.recentTabUrls[tab_id].host) {
+      tab_host = initiator_host;
+      from_current_tab = false;
     }
   }
 
@@ -746,10 +819,10 @@ function recordFingerprinting(tab_id, msg) {
  * Cleans up tab-specific data.
  *
  * @param {Integer} tab_id the ID of the tab
- * @param {Boolean} is_reload whether the page is simply being reloaded
+ * @param {Boolean} is_reload whether the page is being reloaded
  */
 function forgetTab(tab_id, is_reload) {
-  if (utils.hasOwn(badger.tabData, tab_id)) {
+  if (!is_reload && utils.hasOwn(badger.tabData, tab_id)) {
     let pageData = badger.tabData[tab_id].frames[0],
       host = pageData.host;
 
